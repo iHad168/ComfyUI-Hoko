@@ -138,9 +138,13 @@ async def comfyui_agent_invoke(messages: List[Dict[str, Any]], images: List[Imag
             client_session_timeout_seconds=300.0
         )
         
-        server_list = [mcp_server, bing_server]
+        server_list = []
+
+        class DummyAsyncContext:
+            async def __aenter__(self): return self
+            async def __aexit__(self, exc_type, exc_val, exc_tb): pass
         
-        async with mcp_server, bing_server:
+        async with DummyAsyncContext():
             
             # 创建workflow_rewrite_agent实例 (session_id通过context获取)
             workflow_rewrite_agent_instance = create_workflow_rewrite_agent()
@@ -154,43 +158,40 @@ async def comfyui_agent_invoke(messages: List[Dict[str, Any]], images: List[Imag
             
             def rewrite_handoff_input_filter(data: HandoffInputData) -> HandoffInputData:
                 """Filter to replace message history with just the rewrite intent"""
-                intent = get_rewrite_context().rewrite_intent
+                intent = get_rewrite_context().rewrite_intent or "Modify workflow according to intent"
                 log.info(f"Rewrite handoff filter called. Intent: {intent}")
-                
-                # Construct a new HandoffInputData with cleared history
-                # We keep new_items (which contains the handoff tool call) so the agent sees the immediate trigger
-                # But we clear input_history to remove the conversation context
-                
+
                 new_history = ()
                 try:
-                    # Attempt to find a user message in history to clone/modify
-                    # This is a best-effort attempt to make the agent see the intent as a user message
                     for item in data.input_history:
-                        # Check if item looks like a user message (has role='user')
                         if hasattr(item, 'role') and getattr(item, 'role') == 'user':
-                             # Try to create a copy with new content if it's a Pydantic model
-                             if hasattr(item, 'model_copy'):
-                                 # Pydantic V2
-                                 new_item = item.model_copy(update={"content": intent})
-                                 new_history = (new_item,)
-                                 log.info("Successfully constructed new user message item for handoff (Pydantic V2)")
-                                 break
-                             elif hasattr(item, 'copy'):
-                                 # Pydantic V1
-                                 new_item = item.copy(update={"content": intent})
-                                 new_history = (new_item,)
-                                 log.info("Successfully constructed new user message item for handoff (Pydantic V1)")
-                                 break
+                            if hasattr(item, 'model_copy'):
+                                # Pydantic V2
+                                new_item = item.model_copy(update={"content": intent})
+                                new_history = (new_item,)
+                                log.info("Successfully constructed new user message item for handoff (Pydantic V2)")
+                                break
+                            elif hasattr(item, 'copy'):
+                                # Pydantic V1
+                                new_item = item.copy(update={"content": intent})
+                                new_history = (new_item,)
+                                log.info("Successfully constructed new user message item for handoff (Pydantic V1)")
+                                break
                 except Exception as e:
                     log.warning(f"Failed to construct user message item: {e}")
-                
-                # If we couldn't construct a user message, we return empty history.
-                # The agent will still see the handoff tool call in new_items, which contains the intent.
-                
+
+                # 如果上面 clone 唔到，用 agents 嘅 ItemHelpers 建立一個標準 user item，防止 Jinja 報錯
+                if not new_history:
+                    try:
+                        user_item = ItemHelpers.text_message(role="user", text=intent)
+                        new_history = (user_item,)
+                    except Exception:
+                        pass
+
                 return HandoffInputData(
                     input_history=new_history,
-                    pre_handoff_items=(), # Clear pre-handoff items
-                    new_items=tuple(data.new_items), # Keep the handoff tool call
+                    pre_handoff_items=(),
+                    new_items=tuple(data.new_items),
                 )
 
             handoff_rewrite = handoff(

@@ -81,6 +81,36 @@ def create_agent(**kwargs) -> Agent:
         default_headers=default_headers,
     )
 
+    # === 防護網：攔截並修補缺少 user 訊息的請求，防止 Qwen Jinja 500 ===
+    original_create = client.chat.completions.create
+
+    async def patched_create(*args, **create_kwargs):
+        messages = create_kwargs.get("messages")
+        if messages and isinstance(messages, list):
+            has_user = any(
+                (isinstance(m, dict) and m.get("role") == "user") or
+                (getattr(m, "role", None) == "user")
+                for m in messages
+            )
+            if not has_user:
+                patch_msg = {"role": "user", "content": "請根據當前需求執行相應的工作流改寫或操作。"}
+
+                # 判斷第一條是否為 system message
+                first_msg = messages[0]
+                first_role = first_msg.get("role") if isinstance(first_msg, dict) else getattr(first_msg, "role", None)
+
+                if first_role == "system":
+                    # 維持 system 在最前，將 user 插入至其後
+                    create_kwargs["messages"] = [messages[0], patch_msg] + list(messages[1:])
+                else:
+                    # 無 system message 時直接加在最前端
+                    create_kwargs["messages"] = [patch_msg] + list(messages)
+
+        return await original_create(*args, **create_kwargs)
+
+    client.chat.completions.create = patched_create
+    # ==============================================================
+
     # Determine model with proper precedence:
     # 1) Explicit selection from config (model_select from frontend)
     # 2) Explicit kwarg 'model' (call-site override)
